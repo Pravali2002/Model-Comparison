@@ -1,0 +1,7 @@
+python-dotenv
+langchain
+langsmith
+transformers
+torch
+pillow
+boto3
