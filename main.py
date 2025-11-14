@@ -1,11 +1,10 @@
 import os
 import json
 import time
+import random
 import boto3
 from dotenv import load_dotenv
 from langsmith import Client
-import re
-from collections import defaultdict
 
 # ------------------- Load environment variables -------------------
 load_dotenv()
@@ -27,7 +26,7 @@ client = Client(api_key=LANGCHAIN_API_KEY)
 
 # ------------------- Dataset Paths -------------------
 DATASET_DIR = "/Users/pravalika/model_comparison/data/train"
-ANNOTATION_FILE = "/Users/pravalika/model_comparison/data/train/_annotations.coco.json"
+ANNOTATION_FILE = os.path.join(DATASET_DIR, "_annotations.coco.json")
 
 # ------------------- Load Dataset -------------------
 with open(ANNOTATION_FILE, "r") as f:
@@ -43,122 +42,151 @@ models = {
     "nova": "amazon.nova-lite-v1:0"
 }
 
-# ------------------- Helper Functions -------------------
+# ------------------- Bedrock invocation -------------------
 def invoke_model(model_id, image_path):
-    """Invoke model to classify disease category."""
     retries = 3
     for attempt in range(retries):
         try:
             with open(image_path, "rb") as img_file:
                 image_bytes = img_file.read()
+        except Exception as e:
+            print(f"❌ Could not open image {image_path}: {e}")
+            return None
 
+        instruction_text = (
+            "Classify the strawberry image into one of these categories: "
+            "Gray_Mold, Powdery_Mildew, Anthracnose, Missing_calyx, "
+            "Uneven_Ripening, Unripe_Strawberry, Good_Quality, Fasciated_Strawberry. "
+            "Return ONLY the category name."
+        )
+
+        try:
             response = bedrock.converse(
                 modelId=model_id,
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"text": "Classify the strawberry disease category from this image. Return only the disease name."},
+                        {"text": instruction_text},
                         {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}}
                     ]
                 }],
-                inferenceConfig={"maxTokens": 100, "temperature": 0.2},
+                inferenceConfig={"maxTokens": 50, "temperature": 0.0},
             )
-
             return response["output"]["message"]["content"][0].get("text", "").strip()
-
         except Exception as e:
             if "ThrottlingException" in str(e) and attempt < retries - 1:
-                wait = 2 ** attempt
-                print(f"⚠️ Throttled by {model_id}, retrying in {wait}s...")
+                wait = 2 ** attempt + random.uniform(0.2, 0.5)
+                print(f"⚠️ Throttled by {model_id}, retrying in {wait:.1f}s...")
                 time.sleep(wait)
                 continue
             print(f"❌ Error invoking {model_id}: {e}")
             return None
+    return None
 
-def clean_prediction(text):
-    """Extract clean disease name from model output."""
-    if not text:
-        return "Unknown"
-    # Extract bolded text if present
-    match = re.search(r"\*\*(.*?)\*\*", text)
-    if match:
-        return match.group(1).strip()
-    # Remove common filler words
-    text = re.sub(r"(The strawberries.*affected by|This appears to be|disease is|likely|looks like|seems like|appears to be)", "", text, flags=re.I)
-    return text.strip().replace(".", "").title()
+# ------------------- LLM-as-a-Judge -------------------
+def judge_similarity(expected: str, predicted: str, judge_model="amazon.nova-lite-v1:0"):
+    """Use a small LLM to judge if the predicted and expected categories match semantically."""
+    if not predicted or not expected:
+        return False
 
-# ------------------- Create LangSmith Dataset -------------------
+    prompt = (
+        f"You are an expert evaluator for strawberry disease classification.\n"
+        f"Expected label: {expected}\n"
+        f"Predicted label: {predicted}\n\n"
+        "Do these refer to the same or equivalent category? Reply with only 'Yes' or 'No'."
+    )
+
+    try:
+        response = bedrock.converse(
+            modelId=judge_model,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 10, "temperature": 0.0},
+        )
+        output = response["output"]["message"]["content"][0].get("text", "").strip().lower()
+        return "yes" in output
+    except Exception as e:
+        print(f"⚠️ Judge model failed: {e}")
+        return False
+
+# ------------------- LangSmith dataset -------------------
 run_name = f"bedrock_model_comparison_{int(time.time())}"
 print(f"\n📦 Creating LangSmith dataset: {run_name}")
 
 try:
-    dataset = client.create_dataset(dataset_name=run_name)
+    client.create_dataset(dataset_name=run_name)
 except Exception:
-    dataset = client.read_dataset(dataset_name=run_name)
-    print("⚠️ Dataset already exists. Reusing it.")
+    print("⚠️ Dataset already exists, reusing...")
 
-# ------------------- Evaluation -------------------
-results = defaultdict(lambda: {"correct": 0, "total": 0})
+# ------------------- Evaluation loop -------------------
+results = {"pixtral": {"correct": 0, "total": 0}, "nova": {"correct": 0, "total": 0}}
+rows_logged = 0
 
 for img in data["images"]:
     image_filename = img["file_name"]
     image_path = os.path.join(DATASET_DIR, image_filename)
-
     related_anns = [a for a in annotations if a["image_id"] == img["id"]]
     if not related_anns:
         continue
 
-    category_id = related_anns[0]["category_id"]
-    label = categories.get(category_id, "Unknown")
+    label = categories.get(related_anns[0]["category_id"], "Unknown")
+    print(f"\n🖼️ Processing {image_filename} | Expected: {label}")
 
-    print(f"\n🖼️ Processing {image_filename} (label: {label})")
     print("  Invoking Pixtral...")
-    pixtral_output = invoke_model(models["pixtral"], image_path)
-    time.sleep(2)
+    pixtral_raw = invoke_model(models["pixtral"], image_path)
+    time.sleep(1.5)
+
     print("  Invoking Nova...")
-    nova_output = invoke_model(models["nova"], image_path)
+    nova_raw = invoke_model(models["nova"], image_path)
 
-    pixtral_pred = clean_prediction(pixtral_output)
-    nova_pred = clean_prediction(nova_output)
+    # LLM-based accuracy judgment
+    pixtral_correct = judge_similarity(label, pixtral_raw or "")
+    nova_correct = judge_similarity(label, nova_raw or "")
 
-    # Update metrics
     results["pixtral"]["total"] += 1
     results["nova"]["total"] += 1
-    if pixtral_pred.lower() == label.lower():
+    if pixtral_correct:
         results["pixtral"]["correct"] += 1
-    if nova_pred.lower() == label.lower():
-        results["nova"]["correct"] += 1
+        print(f"✅ Pixtral: {pixtral_raw}")
+    else:
+        print(f"❌ Pixtral: {pixtral_raw}")
 
-    # Log to LangSmith
+    if nova_correct:
+        results["nova"]["correct"] += 1
+        print(f"✅ Nova: {nova_raw}")
+    else:
+        print(f"❌ Nova: {nova_raw}")
+
+    pixtral_acc = (results["pixtral"]["correct"] / results["pixtral"]["total"]) * 100
+    nova_acc = (results["nova"]["correct"] / results["nova"]["total"]) * 100
+
     client.create_example(
         dataset_name=run_name,
         inputs={"image_file": image_filename},
         outputs={
             "expected_category": label,
-            "pixtral_pred": pixtral_pred or "Error/empty",
-            "nova_pred": nova_pred or "Error/empty",
+            "pixtral_pred": pixtral_raw or "Empty",
+            "pixtral_accuracy_running_pct": f"{pixtral_acc:.2f}",
+            "nova_pred": nova_raw or "Empty",
+            "nova_accuracy_running_pct": f"{nova_acc:.2f}",
         },
     )
+    rows_logged += 1
 
-# ------------------- Accuracy Summary -------------------
+# ------------------- Final summary -------------------
 print("\n📊 Model Comparison Summary:")
-for model_name, stats in results.items():
-    acc = (stats["correct"] / stats["total"]) * 100 if stats["total"] > 0 else 0
-    print(f"  {model_name.capitalize()} Accuracy: {acc:.2f}% ({stats['correct']}/{stats['total']})")
+for model, stats in results.items():
+    acc = (stats["correct"] / stats["total"]) * 100 if stats["total"] else 0
+    print(f"  {model.capitalize()} Accuracy: {acc:.2f}% ({stats['correct']}/{stats['total']})")
 
-# Log summary row to LangSmith
 client.create_example(
     dataset_name=run_name,
-    inputs={"summary": "Overall model comparison results"},
+    inputs={"summary": "overall accuracy"},
     outputs={
-        "pixtral_accuracy": f"{(results['pixtral']['correct'] / results['pixtral']['total'])*100:.2f}%" if results["pixtral"]["total"] > 0 else "N/A",
-        "nova_accuracy": f"{(results['nova']['correct'] / results['nova']['total'])*100:.2f}%" if results["nova"]["total"] > 0 else "N/A",
-        "pixtral_correct": results["pixtral"]["correct"],
-        "nova_correct": results["nova"]["correct"],
-        "pixtral_total": results["pixtral"]["total"],
-        "nova_total": results["nova"]["total"],
+        "pixtral_accuracy_pct": f"{(results['pixtral']['correct'] / results['pixtral']['total'] * 100):.2f}" if results["pixtral"]["total"] > 0 else "N/A",
+        "nova_accuracy_pct": f"{(results['nova']['correct'] / results['nova']['total'] * 100):.2f}" if results["nova"]["total"] > 0 else "N/A",
+        "rows_logged": rows_logged,
     },
 )
 
-print(f"\n✅ All results logged to LangSmith dataset: {run_name}")
+print(f"\n✅ Done — results logged to LangSmith dataset: {run_name}")
 print("🔗 View it at: https://smith.langchain.com/datasets")
